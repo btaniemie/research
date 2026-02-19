@@ -5,6 +5,7 @@ import pandas as pd
 import pymupdf
 import pymupdf.pro
 import sys
+from collections import defaultdict
 
 PILOT_MODE = False      
 DPI = 300
@@ -90,20 +91,30 @@ def get_marker_map(doc, vol_name):
     return marker_map
 
 def extract_content_v2(doc, marker_map, start_p, end_p, vol_name):
-    """Page N is between marker N-1 and N."""
-    actual_start_marker = start_p - 1
+    """
+    Handles ghost pages by looking backwards for the nearest valid marker 
+    if the ideal N-1 marker is missing.
+    """
     actual_end_marker = end_p
-    
-    # Exception for first pages
     is_first_page = (start_p == VOL_STARTS.get(vol_name))
     
-    # If not the first page and we can't find the 'previous' marker, we have a problem
-    if not is_first_page and actual_start_marker not in marker_map:
+    actual_start_marker = None
+    if is_first_page:
+        actual_start_marker = "START" 
+    else:
+        # Try to find the N-1 marker. If missing, look for N-2, N-3...
+        for lookback in range(1, 10): # Look back up to 10 pages
+            candidate = start_p - lookback
+            if candidate in marker_map:
+                actual_start_marker = candidate
+                break
+    
+    if actual_start_marker is None:
         return None
+    
     if actual_end_marker not in marker_map:
         return None
 
-    # Determine PDF index range
     pdf_start = 0 if is_first_page else marker_map[actual_start_marker][0]
     pdf_end = marker_map[actual_end_marker][0]
     
@@ -114,10 +125,16 @@ def extract_content_v2(doc, marker_map, start_p, end_p, vol_name):
     full_text = "\n".join(pages_text)
     
     try:
-        # Cut text starting AFTER the N-1 marker (or from 0 if first page)
-        idx_start = 0 if is_first_page else full_text.find(str(actual_start_marker)) + len(str(actual_start_marker))
-        # Cut text ending BEFORE the N marker
+        if is_first_page:
+            idx_start = 0
+        else:
+            marker_str = str(actual_start_marker)
+            idx_start = full_text.find(marker_str) + len(marker_str)
+            
         idx_end = full_text.find(str(actual_end_marker), idx_start)
+        
+        # If slicing fails, return the whole text found in those pages
+        if idx_end == -1: return full_text.strip()
         
         return full_text[idx_start:idx_end].strip()
     except:
@@ -127,6 +144,7 @@ def main():
     df = pd.read_csv(CSV_INDEX_PATH, encoding='latin1')
     current_vol = None
     tasks = []
+    missing_log = [] # Store missing entries here
 
     for _, row in df.iterrows():
         first_val = str(row.iloc[0]).strip().upper()
@@ -143,7 +161,6 @@ def main():
                 'date': str(row.get('DATES', 'Unknown'))
             })
 
-    from collections import defaultdict
     vol_grouped = defaultdict(list)
     for t in tasks: vol_grouped[t['vol']].append(t)
 
@@ -159,14 +176,32 @@ def main():
         for task in vol_tasks:
             safe_name = re.sub(r'[\\/*?:"<>|]', "", task['content'])[:50]
             out_file = os.path.join(vol_dir, f"{task['start']}_{safe_name}.txt")
+            
             if os.path.exists(out_file): continue 
 
             text = extract_content_v2(doc, marker_map, task['start'], task['end'], vol_name)
+            
             if text:
                 with open(out_file, "w", encoding="utf-8") as f:
-                    f.write(text)
+                    f.write(f"DATE: {task['date']}\n" + "-"*20 + "\n" + text)
                 print(f"✅ Saved {task['start']}-{task['end']}")
+            else:
+                # Log why it failed
+                missing_log.append({
+                    'Volume': vol_name,
+                    'Start_Page': task['start'],
+                    'End_Page': task['end'],
+                    'Content': task['content']
+                })
         doc.close()
+
+    # Save the missing log to a CSV
+    if missing_log:
+        log_df = pd.DataFrame(missing_log)
+        log_df.to_csv("missing_extractions_report.csv", index=False)
+        print(f"\n⚠️ Extraction complete. {len(missing_log)} files could not be generated. Check missing_extractions_report.csv")
+    else:
+        print("\n✅ All files generated successfully!")
 
 if __name__ == "__main__":
     main()
